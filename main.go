@@ -106,9 +106,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Запускаем основной TCP сервер
+	// Запускаем основной TCP сервер - передаем оба аргумента
+	// Второй аргумент (httpPort) вероятно используется для внутреннего HTTP сервера
 	go func() {
-		if err := messengerServer.Start(ctx); err != nil {
+		if err := messengerServer.Start(ctx, httpPort); err != nil {
 			log.Printf("❌ TCP server error: %v", err)
 		}
 	}()
