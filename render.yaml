@@ -3,12 +3,12 @@ services:
     name: telegraf
     env: go
     plan: free
-    buildCommand: mkdir -p bin && go build -o bin/telegraf
-    startCommand: ./bin/telegraf
+    buildCommand: go build -o server
+    startCommand: ./server
     envVars:
       - key: ENVIRONMENT
         value: production
       - key: PORT
-        value: 8080
+        generateValue: true
       - key: HTTP_PORT
-        value: 8081
+        value: "8081"
