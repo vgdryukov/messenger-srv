@@ -3,26 +3,30 @@ package shared
 import "time"
 
 type User struct {
-	Username string `json:"username"`
-	Password string `json:"password"` // хранится как sha256
-	Email    string `json:"email,omitempty"`
+	Username    string    `json:"username"`
+	Password    string    `json:"password"` // хранится как sha256
+	Email       string    `json:"email,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	LastLoginAt time.Time `json:"last_login_at,omitempty"`
 }
 
 type Message struct {
-	ID      int64     `json:"id"`
-	From    string    `json:"from"`
-	To      string    `json:"to"`
-	Content string    `json:"content"`
-	SentAt  time.Time `json:"sent_at"`
-	IsGroup bool      `json:"is_group"`
-	GroupID string    `json:"group_id,omitempty"`
+	ID        int64     `json:"id"`
+	From      string    `json:"from"`
+	To        string    `json:"to"`
+	Content   string    `json:"content"`
+	SentAt    time.Time `json:"sent_at"`
+	IsGroup   bool      `json:"is_group"`
+	GroupID   string    `json:"group_id,omitempty"`
+	Delivered bool      `json:"delivered"`
 }
 
 type Group struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Owner   string   `json:"owner"`
-	Members []string `json:"members"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Owner     string    `json:"owner"`
+	Members   []string  `json:"members"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type Request struct {
