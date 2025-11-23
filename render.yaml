@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: p2p-messenger
+    name: telegraf
     env: go
     plan: free
     buildCommand: go build -o server main.go

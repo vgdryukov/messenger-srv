@@ -1,3 +1,3 @@
-module github.com/vgdryukov/messenger-srv
+module telegraf
 
 go 1.21
