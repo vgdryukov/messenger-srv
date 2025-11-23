@@ -17,7 +17,7 @@ func getConfig() (string, string, string) {
 	// PORT используется Render для health checks - это должен быть HTTP порт
 	httpPort := os.Getenv("PORT")
 	if httpPort == "" {
-		httpPort = "8081"
+		httpPort = "8080" // Render автоматически назначает порт
 	}
 
 	// TCP порт для вашего приложения
@@ -40,6 +40,7 @@ func startHealthCheckServer(port string) *http.Server {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "HEAD" || r.Method == "GET" {
 			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK"))
 			return
 		}
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -105,9 +106,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Запускаем основной TCP сервер - передаем оба аргумента
+	// Запускаем основной TCP сервер
 	go func() {
-		if err := messengerServer.Start(ctx, httpPort); err != nil {
+		if err := messengerServer.Start(ctx); err != nil {
 			log.Printf("❌ TCP server error: %v", err)
 		}
 	}()

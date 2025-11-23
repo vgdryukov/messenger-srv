@@ -9,6 +9,6 @@ services:
       - key: ENVIRONMENT
         value: production
       - key: PORT
-        value: "8081"  # HTTP порт для health checks
-      - key: TCP_PORT  
-        value: "10000" # TCP порт для вашего приложения
+        generateValue: true  # Render сам назначит порт для HTTP
+      - key: TCP_PORT
+        value: "10000"      # Фиксированный порт для TCP
