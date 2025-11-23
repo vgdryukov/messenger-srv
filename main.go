@@ -19,13 +19,13 @@ func getConfig() (string, string, string) {
 
 	httpPort := os.Getenv("HTTP_PORT")
 	if httpPort == "" {
-		// По умолчанию HTTP на порту 8081
-		httpPort = "8081"
+		// В production используем тот же порт для HTTP
+		httpPort = port
 	}
 
 	environment := os.Getenv("ENVIRONMENT")
 	if environment == "" {
-		environment = "development"
+		environment = "production" // По умолчанию production на Render
 	}
 
 	return port, httpPort, environment
@@ -39,9 +39,9 @@ func main() {
 	fmt.Printf("🔌 TCP Port: %s\n", port)
 	fmt.Printf("🌐 HTTP Port: %s\n", httpPort)
 
-	host := "localhost"
-	if environment == "production" {
-		host = "0.0.0.0"
+	host := "0.0.0.0" // Всегда слушаем все интерфейсы в production
+	if environment == "development" {
+		host = "localhost"
 	}
 
 	serverConfig := server.ServerConfig{
@@ -64,7 +64,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Запускаем сервер с HTTP портом
 	if err := messengerServer.Start(ctx, httpPort); err != nil {
 		log.Fatal("Failed to start server:", err)
 	}
