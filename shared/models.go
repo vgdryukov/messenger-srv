@@ -4,7 +4,7 @@ import "time"
 
 type User struct {
 	Username    string    `json:"username"`
-	Password    string    `json:"password"` // хранится как sha256
+	Password    string    `json:"password"`
 	Email       string    `json:"email,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	LastLoginAt time.Time `json:"last_login_at,omitempty"`

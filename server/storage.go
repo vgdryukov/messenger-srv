@@ -5,16 +5,15 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"telegraf/config"
 	"telegraf/shared"
-	"time"
 )
 
-// Storage интерфейс для тестирования
+// Storage интерфейс
 type Storage interface {
 	GetUser(username string) (*shared.User, bool)
 	AddUser(user *shared.User)
 	SaveUsers() error
+	LoadAll() error
 	GetMessages(username string) []shared.Message
 	AddMessage(msg shared.Message)
 	SaveMessages() error
@@ -24,88 +23,25 @@ type Storage interface {
 	GetGroup(groupID string) (*shared.Group, bool)
 	AddGroup(group *shared.Group)
 	SaveGroups() error
-	LoadAll() error
 }
 
 type DataStorage struct {
-	config       config.Storage
-	mutex        sync.RWMutex
-	users        map[string]*shared.User
-	messageBatch *MessageBatch
-	contacts     map[string][]string // username -> []contacts
-	groups       map[string]*shared.Group
-}
-
-type MessageBatch struct {
-	messages []shared.Message
+	config   StorageConfig
 	mutex    sync.RWMutex
-	timer    *time.Timer
-	storage  *DataStorage
+	users    map[string]*shared.User
+	contacts map[string][]string
+	groups   map[string]*shared.Group
+	messages []shared.Message
 }
 
-func NewMessageBatch(storage *DataStorage) *MessageBatch {
-	mb := &MessageBatch{
-		messages: make([]shared.Message, 0),
-		storage:  storage,
-	}
-	return mb
-}
-
-func (mb *MessageBatch) Add(msg shared.Message) {
-	mb.mutex.Lock()
-	defer mb.mutex.Unlock()
-
-	mb.messages = append(mb.messages, msg)
-
-	// Запускаем таймер для пакетной записи, если он еще не запущен
-	if mb.timer == nil {
-		mb.timer = time.AfterFunc(5*time.Second, mb.Flush)
-	}
-
-	// Принудительная запись при достижении лимита
-	if len(mb.messages) >= 100 {
-		mb.Flush()
-	}
-}
-
-func (mb *MessageBatch) Flush() {
-	mb.mutex.Lock()
-	defer mb.mutex.Unlock()
-
-	if len(mb.messages) == 0 {
-		return
-	}
-
-	// Добавляем сообщения в основное хранилище
-	for _, msg := range mb.messages {
-		mb.storage.addMessageDirect(msg)
-	}
-
-	// Сохраняем на диск
-	if err := mb.storage.saveMessagesDirect(); err != nil {
-		// Логируем ошибку, но не паникуем
-		fmt.Printf("Error saving messages batch: %v\n", err)
-	}
-
-	// Очищаем батч
-	mb.messages = make([]shared.Message, 0)
-
-	// Сбрасываем таймер
-	if mb.timer != nil {
-		mb.timer.Stop()
-		mb.timer = nil
-	}
-}
-
-func NewDataStorage(cfg config.Storage) *DataStorage {
-	storage := &DataStorage{
+func NewDataStorage(cfg StorageConfig) *DataStorage {
+	return &DataStorage{
 		config:   cfg,
 		users:    make(map[string]*shared.User),
 		contacts: make(map[string][]string),
 		groups:   make(map[string]*shared.Group),
+		messages: make([]shared.Message, 0),
 	}
-	storage.messageBatch = NewMessageBatch(storage)
-	return storage
 }
 
 func (ds *DataStorage) LoadAll() error {
@@ -124,7 +60,6 @@ func (ds *DataStorage) LoadAll() error {
 	return nil
 }
 
-// Реализация методов Storage интерфейса...
 func (ds *DataStorage) GetUser(username string) (*shared.User, bool) {
 	ds.mutex.RLock()
 	defer ds.mutex.RUnlock()
@@ -150,7 +85,6 @@ func (ds *DataStorage) saveUsersDirect() error {
 		return err
 	}
 	defer file.Close()
-
 	encoder := json.NewEncoder(file)
 	return encoder.Encode(ds.users)
 }
@@ -159,24 +93,21 @@ func (ds *DataStorage) loadUsers() error {
 	file, err := os.Open(ds.config.UsersFile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // Файл не существует - это нормально при первом запуске
+			return nil
 		}
 		return err
 	}
 	defer file.Close()
-
 	decoder := json.NewDecoder(file)
 	return decoder.Decode(&ds.users)
 }
 
-// Аналогичные методы для messages, contacts, groups...
 func (ds *DataStorage) GetMessages(username string) []shared.Message {
 	ds.mutex.RLock()
 	defer ds.mutex.RUnlock()
-
 	var userMessages []shared.Message
-	for _, msg := range ds.messageBatch.messages {
-		if msg.To == username {
+	for _, msg := range ds.messages {
+		if msg.To == username || msg.From == username {
 			userMessages = append(userMessages, msg)
 		}
 	}
@@ -184,27 +115,38 @@ func (ds *DataStorage) GetMessages(username string) []shared.Message {
 }
 
 func (ds *DataStorage) AddMessage(msg shared.Message) {
-	ds.messageBatch.Add(msg)
-}
-
-func (ds *DataStorage) addMessageDirect(msg shared.Message) {
-	// Этот метод используется только внутри батча
-	// В реальной реализации здесь было бы добавление в основное хранилище
+	ds.mutex.Lock()
+	defer ds.mutex.Unlock()
+	ds.messages = append(ds.messages, msg)
 }
 
 func (ds *DataStorage) SaveMessages() error {
-	ds.messageBatch.Flush()
-	return nil
+	ds.mutex.Lock()
+	defer ds.mutex.Unlock()
+	return ds.saveMessagesDirect()
 }
 
 func (ds *DataStorage) saveMessagesDirect() error {
-	// Реализация сохранения сообщений
-	return nil
+	file, err := os.Create(ds.config.MessagesFile)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	encoder := json.NewEncoder(file)
+	return encoder.Encode(ds.messages)
 }
 
 func (ds *DataStorage) loadMessages() error {
-	// Реализация загрузки сообщений
-	return nil
+	file, err := os.Open(ds.config.MessagesFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(file)
+	return decoder.Decode(&ds.messages)
 }
 
 func (ds *DataStorage) GetContacts(username string) []string {
@@ -216,14 +158,11 @@ func (ds *DataStorage) GetContacts(username string) []string {
 func (ds *DataStorage) AddContact(username, contact string) error {
 	ds.mutex.Lock()
 	defer ds.mutex.Unlock()
-
-	// Проверяем дубликаты
 	for _, existing := range ds.contacts[username] {
 		if existing == contact {
 			return fmt.Errorf("contact already exists")
 		}
 	}
-
 	ds.contacts[username] = append(ds.contacts[username], contact)
 	return nil
 }
@@ -240,7 +179,6 @@ func (ds *DataStorage) saveContactsDirect() error {
 		return err
 	}
 	defer file.Close()
-
 	encoder := json.NewEncoder(file)
 	return encoder.Encode(ds.contacts)
 }
@@ -254,7 +192,6 @@ func (ds *DataStorage) loadContacts() error {
 		return err
 	}
 	defer file.Close()
-
 	decoder := json.NewDecoder(file)
 	return decoder.Decode(&ds.contacts)
 }
@@ -284,7 +221,6 @@ func (ds *DataStorage) saveGroupsDirect() error {
 		return err
 	}
 	defer file.Close()
-
 	encoder := json.NewEncoder(file)
 	return encoder.Encode(ds.groups)
 }
@@ -298,7 +234,6 @@ func (ds *DataStorage) loadGroups() error {
 		return err
 	}
 	defer file.Close()
-
 	decoder := json.NewDecoder(file)
 	return decoder.Decode(&ds.groups)
 }

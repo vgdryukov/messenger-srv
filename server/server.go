@@ -1,164 +1,263 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"log"
 	"net"
+	"net/http"
 	"sync"
-	"telegraf/config"
 	"telegraf/shared"
 	"time"
 )
 
 type MessengerServer struct {
 	storage     Storage
-	config      *config.Config
-	logger      *Logger
-	validator   *Validator
-	rateLimiter *RateLimiter
-
+	config      ServerConfig
 	onlineUsers map[string]net.Conn
 	mutex       sync.RWMutex
-
-	messageBatch *MessageBatch
 }
 
-type ServerConfig struct {
-	Host string `json:"host"`
-	Port string `json:"port"`
-}
-
-func NewMessengerServer(cfg *config.Config, logger *Logger) *MessengerServer {
-	storage := NewDataStorage(cfg.Storage)
-	validator := NewValidator()
-	rateLimiter := NewRateLimiter(
-		cfg.RateLimit.MaxAttempts,
-		cfg.RateLimit.WindowSize,
-		cfg.RateLimit.MessageLimit,
-		cfg.RateLimit.MessageWindow,
-	)
-
+func NewMessengerServer(config ServerConfig, storageConfig StorageConfig) *MessengerServer {
+	storage := NewDataStorage(storageConfig)
 	return &MessengerServer{
 		storage:     storage,
-		config:      cfg,
-		logger:      logger,
-		validator:   validator,
-		rateLimiter: rateLimiter,
+		config:      config,
 		onlineUsers: make(map[string]net.Conn),
 	}
 }
 
-func (ms *MessengerServer) Start(ctx context.Context) error {
-	// Загрузка данных
+func (ms *MessengerServer) Start(ctx context.Context, httpPort string) error {
 	if err := ms.storage.LoadAll(); err != nil {
 		return fmt.Errorf("failed to load data: %v", err)
 	}
 
-	// Запуск фоновых задач
-	go ms.cleanupWorker(ctx)
+	tcpAddress := fmt.Sprintf("%s:%s", ms.config.Host, ms.config.Port)
+	httpAddress := fmt.Sprintf("%s:%s", ms.config.Host, httpPort)
 
-	address := fmt.Sprintf("%s:%s", ms.config.Server.Host, ms.config.Server.Port)
-	listener, err := net.Listen("tcp", address)
+	// Запускаем HTTP сервер для веб-клиента в отдельной горутине
+	go ms.startHTTPServer(httpAddress)
+
+	// Основной TCP сервер для десктопного клиента
+	listener, err := net.Listen("tcp", tcpAddress)
 	if err != nil {
-		return fmt.Errorf("failed to start listener on %s: %v", address, err)
+		return fmt.Errorf("failed to start TCP listener on %s: %v", tcpAddress, err)
 	}
 	defer listener.Close()
 
-	ms.logger.Info("🚀 P2P Messenger Server started on %s", address)
-	ms.logger.Info("📍 Host: %s, Port: %s", ms.config.Server.Host, ms.config.Server.Port)
+	log.Printf("🚀 P2P Messenger Server started")
+	log.Printf("📍 Host: %s", ms.config.Host)
+	log.Printf("🔌 TCP Server: %s", tcpAddress)
+	log.Printf("🌐 HTTP Server: http://%s", httpAddress)
 
-	// Обработка входящих соединений
-	go ms.acceptConnections(ctx, listener)
-
-	// Ожидание сигнала завершения
-	<-ctx.Done()
-	ms.logger.Info("Shutting down server...")
-
-	// Graceful shutdown - даем время на завершение операций
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	ms.performCleanup(shutdownCtx)
-
-	return nil
-}
-
-func (ms *MessengerServer) acceptConnections(ctx context.Context, listener net.Listener) {
+	// Простой цикл принятия соединений
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			log.Println("🛑 Server shutting down...")
+			return nil
 		default:
 			conn, err := listener.Accept()
 			if err != nil {
-				// Проверяем, не был ли listener закрыт
-				if ctx.Err() != nil {
-					return
-				}
-				ms.logger.Error("Accept error: %v", err)
+				log.Printf("❌ TCP Accept error: %v", err)
 				continue
 			}
-			go ms.handleConnection(conn)
+			go ms.handleTCPConnection(conn)
 		}
 	}
 }
 
-func (ms *MessengerServer) handleConnection(conn net.Conn) {
+// HTTP сервер
+func (ms *MessengerServer) startHTTPServer(address string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", ms.handleHTTPRoot)
+	mux.HandleFunc("/api", ms.handleHTTPApi)
+
+	server := &http.Server{
+		Addr:    address,
+		Handler: mux,
+	}
+
+	log.Printf("🌐 HTTP server starting on http://%s", address)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("❌ HTTP server error: %v", err)
+	}
+}
+
+// Обработчик корневого пути HTTP
+func (ms *MessengerServer) handleHTTPRoot(w http.ResponseWriter, r *http.Request) {
+	ms.setCORSHeaders(w)
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	response := map[string]string{
+		"status":  "success",
+		"message": "P2P Messenger Server is running",
+		"version": "2.0.0",
+		"api":     "Use POST /api with JSON body",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// Обработчик API запросов HTTP
+func (ms *MessengerServer) handleHTTPApi(w http.ResponseWriter, r *http.Request) {
+	ms.setCORSHeaders(w)
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method != "POST" {
+		http.Error(w, `{"status":"error","message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"status":"error","message":"Error reading request body"}`, http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	log.Printf("📨 HTTP Request: %s", string(body))
+
+	var request shared.Request
+	if err := json.Unmarshal(body, &request); err != nil {
+		log.Printf("❌ HTTP JSON error: %v", err)
+		http.Error(w, `{"status":"error","message":"Invalid JSON format"}`, http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("🔍 HTTP Action: %s, User: %s", request.Action, request.Username)
+
+	response := ms.handleRequest(request, &fakeConn{})
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("❌ HTTP Response error: %v", err)
+		http.Error(w, `{"status":"error","message":"Internal server error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("📤 HTTP Response: %s", response.Status)
+}
+
+// Установка CORS заголовков
+func (ms *MessengerServer) setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
+// Обработчик TCP соединений
+func (ms *MessengerServer) handleTCPConnection(conn net.Conn) {
 	defer conn.Close()
 
 	remoteAddr := conn.RemoteAddr().String()
-	ms.logger.Info("🔗 New connection from %s", remoteAddr)
+	log.Printf("🔗 TCP Connection from %s", remoteAddr)
 
-	// Установка таймаутов
-	conn.SetReadDeadline(time.Now().Add(ms.config.Server.ReadTimeout))
-	conn.SetWriteDeadline(time.Now().Add(ms.config.Server.WriteTimeout))
+	// Устанавливаем таймауты
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
-	decoder := json.NewDecoder(conn)
+	reader := bufio.NewReader(conn)
 
 	for {
-		var request shared.Request
-		if err := decoder.Decode(&request); err != nil {
+		// Читаем данные до новой строки
+		data, err := reader.ReadBytes('\n')
+		if err != nil {
 			if err != io.EOF {
-				ms.logger.Error("JSON decode error from %s: %v", remoteAddr, err)
+				log.Printf("❌ TCP Read error from %s: %v", remoteAddr, err)
 			} else {
-				ms.logger.Info("📤 Connection closed by %s", remoteAddr)
+				log.Printf("📤 TCP Connection closed by %s", remoteAddr)
 			}
 
-			// Удаляем пользователя из онлайн списка при отключении
-			ms.mutex.Lock()
-			for username, userConn := range ms.onlineUsers {
-				if userConn == conn {
-					delete(ms.onlineUsers, username)
-					ms.logger.Info("👤 User %s went offline", username)
-					break
-				}
-			}
-			ms.mutex.Unlock()
+			ms.removeUserFromOnline(conn)
 			return
 		}
 
-		// Обновляем таймаут
-		conn.SetReadDeadline(time.Now().Add(ms.config.Server.ReadTimeout))
-		conn.SetWriteDeadline(time.Now().Add(ms.config.Server.WriteTimeout))
+		// Убираем символ новой строки
+		if len(data) > 0 && data[len(data)-1] == '\n' {
+			data = data[:len(data)-1]
+		}
+		if len(data) > 0 && data[len(data)-1] == '\r' {
+			data = data[:len(data)-1]
+		}
 
-		ms.logger.Debug("📨 Request from %s: %s (user: %s)", remoteAddr, request.Action, request.Username)
+		// Пропускаем пустые строки
+		if len(data) == 0 {
+			continue
+		}
 
+		log.Printf("📨 TCP Raw data from %s: %s", remoteAddr, string(data))
+
+		var request shared.Request
+		if err := json.Unmarshal(data, &request); err != nil {
+			log.Printf("❌ TCP JSON error from %s: %v", remoteAddr, err)
+			response := shared.Response{Status: "error", Message: "Invalid JSON format"}
+			ms.sendTCPResponse(conn, response)
+			continue
+		}
+
+		log.Printf("📨 TCP Request from %s: %s (user: %s)", remoteAddr, request.Action, request.Username)
 		response := ms.handleRequest(request, conn)
-		responseData, _ := json.Marshal(response)
+		ms.sendTCPResponse(conn, response)
 
-		if _, err := conn.Write(responseData); err != nil {
-			ms.logger.Error("Write error to %s: %v", remoteAddr, err)
-			return
-		}
-
-		ms.logger.Debug("📤 Response sent to %s: %s", remoteAddr, response.Status)
+		// Обновляем таймауты
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	}
 }
 
+// Отправка ответа по TCP
+func (ms *MessengerServer) sendTCPResponse(conn net.Conn, response shared.Response) {
+	responseData, _ := json.Marshal(response)
+	responseData = append(responseData, '\n')
+
+	if _, err := conn.Write(responseData); err != nil {
+		log.Printf("❌ TCP Write error: %v", err)
+	}
+
+	log.Printf("📤 TCP Response sent: %s", response.Status)
+}
+
+// Удаление пользователя из онлайн списка
+func (ms *MessengerServer) removeUserFromOnline(conn net.Conn) {
+	ms.mutex.Lock()
+	defer ms.mutex.Unlock()
+
+	for username, userConn := range ms.onlineUsers {
+		if userConn == conn {
+			delete(ms.onlineUsers, username)
+			log.Printf("👤 User %s went offline", username)
+			break
+		}
+	}
+}
+
+// Fake connection для HTTP запросов
+type fakeConn struct{}
+
+func (f *fakeConn) Read(b []byte) (n int, err error)   { return 0, io.EOF }
+func (f *fakeConn) Write(b []byte) (n int, err error)  { return len(b), nil }
+func (f *fakeConn) Close() error                       { return nil }
+func (f *fakeConn) LocalAddr() net.Addr                { return &net.TCPAddr{} }
+func (f *fakeConn) RemoteAddr() net.Addr               { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
+func (f *fakeConn) SetDeadline(t time.Time) error      { return nil }
+func (f *fakeConn) SetReadDeadline(t time.Time) error  { return nil }
+func (f *fakeConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// Основной обработчик запросов (общий для HTTP и TCP)
 func (ms *MessengerServer) handleRequest(request shared.Request, conn net.Conn) shared.Response {
 	switch request.Action {
 	case "register":
@@ -178,7 +277,7 @@ func (ms *MessengerServer) handleRequest(request shared.Request, conn net.Conn) 
 	case "get_contacts":
 		return ms.handleGetContacts(request)
 	default:
-		ms.logger.Warn("Unknown action from %s: %s", request.Username, request.Action)
+		log.Printf("❌ Unknown action from %s: %s", request.Username, request.Action)
 		return shared.Response{Status: "error", Message: "Unknown action: " + request.Action}
 	}
 }
@@ -188,25 +287,10 @@ func (ms *MessengerServer) handleRegister(request shared.Request) shared.Respons
 		return shared.Response{Status: "error", Message: "Username and password are required"}
 	}
 
-	// Валидация
-	if !ms.validator.ValidateUsername(request.Username) {
-		return shared.Response{Status: "error", Message: "Username must be 3-16 characters and contain only letters, numbers, underscores and hyphens"}
-	}
-
-	if !ms.validator.ValidatePassword(request.Password) {
-		return shared.Response{Status: "error", Message: "Password must be 6-32 characters"}
-	}
-
-	if !ms.validator.ValidateEmail(request.Email) {
-		return shared.Response{Status: "error", Message: "Invalid email format"}
-	}
-
-	// Проверка существования пользователя
 	if _, exists := ms.storage.GetUser(request.Username); exists {
 		return shared.Response{Status: "error", Message: "Username already exists"}
 	}
 
-	// Создание пользователя
 	passwordHash := fmt.Sprintf("%x", sha256.Sum256([]byte(request.Password)))
 	user := &shared.User{
 		Username:  request.Username,
@@ -218,11 +302,11 @@ func (ms *MessengerServer) handleRegister(request shared.Request) shared.Respons
 	ms.storage.AddUser(user)
 
 	if err := ms.storage.SaveUsers(); err != nil {
-		ms.logger.Error("Failed to save users: %v", err)
+		log.Printf("❌ Failed to save users: %v", err)
 		return shared.Response{Status: "error", Message: "Failed to save user data"}
 	}
 
-	ms.logger.Info("✅ New user registered: %s", request.Username)
+	log.Printf("✅ New user registered: %s", request.Username)
 	return shared.Response{Status: "success", Message: "Registration successful"}
 }
 
@@ -231,32 +315,32 @@ func (ms *MessengerServer) handleLogin(request shared.Request, conn net.Conn) sh
 		return shared.Response{Status: "error", Message: "Username and password are required"}
 	}
 
-	// Rate limiting
-	if !ms.rateLimiter.AllowLogin(request.Username) {
-		ms.logger.Warn("Rate limit exceeded for user: %s", request.Username)
-		return shared.Response{Status: "error", Message: "Too many login attempts. Please try again later."}
-	}
-
 	user, exists := ms.storage.GetUser(request.Username)
 	if !exists {
-		ms.logger.Warn("Login failed - user not found: %s", request.Username)
+		log.Printf("❌ Login failed - user not found: %s", request.Username)
 		return shared.Response{Status: "error", Message: "Invalid credentials"}
 	}
 
 	passwordHash := fmt.Sprintf("%x", sha256.Sum256([]byte(request.Password)))
 	if user.Password != passwordHash {
-		ms.logger.Warn("Login failed - invalid password for: %s", request.Username)
+		log.Printf("❌ Login failed - invalid password for: %s", request.Username)
 		return shared.Response{Status: "error", Message: "Invalid credentials"}
 	}
 
 	// Обновляем время последнего входа
 	user.LastLoginAt = time.Now()
+	ms.storage.SaveUsers()
 
-	ms.mutex.Lock()
-	ms.onlineUsers[request.Username] = conn
-	ms.mutex.Unlock()
+	// Добавляем в онлайн пользователей только для TCP соединений
+	if realConn, ok := conn.(*net.TCPConn); ok {
+		ms.mutex.Lock()
+		ms.onlineUsers[request.Username] = realConn
+		ms.mutex.Unlock()
+		log.Printf("✅ User logged in via TCP: %s from %s", request.Username, conn.RemoteAddr())
+	} else {
+		log.Printf("✅ User logged in via HTTP: %s", request.Username)
+	}
 
-	ms.logger.Info("✅ User logged in: %s from %s", request.Username, conn.RemoteAddr())
 	return shared.Response{Status: "success", Message: "Login successful"}
 }
 
@@ -268,30 +352,19 @@ func (ms *MessengerServer) handleRecover(request shared.Request) shared.Response
 	user, exists := ms.storage.GetUser(request.Username)
 	if !exists {
 		// Не раскрываем информацию о существовании пользователя
-		ms.logger.Info("Password recovery attempted for non-existent user: %s", request.Username)
-		return shared.Response{Status: "success", Message: "If the user exists, a recovery email has been sent"}
+		log.Printf("🔐 Password recovery attempted for non-existent user: %s", request.Username)
+		return shared.Response{Status: "success", Message: "If the user exists, recovery instructions have been sent"}
 	}
 
 	if user.Email != request.Email {
-		ms.logger.Warn("Password recovery email mismatch for user: %s", request.Username)
-		return shared.Response{Status: "success", Message: "If the user exists, a recovery email has been sent"}
+		log.Printf("🔐 Password recovery email mismatch for user: %s", request.Username)
+		return shared.Response{Status: "success", Message: "If the user exists, recovery instructions have been sent"}
 	}
 
-	// Генерация временного пароля
-	tempPassword := generateTempPassword()
-	user.Password = fmt.Sprintf("%x", sha256.Sum256([]byte(tempPassword)))
-
-	if err := ms.storage.SaveUsers(); err != nil {
-		ms.logger.Error("Failed to save temporary password: %v", err)
-		return shared.Response{Status: "error", Message: "Failed to process recovery request"}
-	}
-
-	// В реальном приложении здесь была бы отправка email
-	ms.logger.Info("🔐 Password recovery for user: %s, temp password: %s", request.Username, tempPassword)
-
+	log.Printf("🔐 Password recovery for user: %s", request.Username)
 	return shared.Response{
 		Status:  "success",
-		Message: "Temporary password has been sent to your email",
+		Message: "Password recovery instructions have been sent to your email",
 	}
 }
 
@@ -304,10 +377,6 @@ func (ms *MessengerServer) handleAddContact(request shared.Request) shared.Respo
 		return shared.Response{Status: "error", Message: "Cannot add yourself as contact"}
 	}
 
-	if !ms.validator.ValidateUsername(request.Contact) {
-		return shared.Response{Status: "error", Message: "Invalid contact username"}
-	}
-
 	if _, exists := ms.storage.GetUser(request.Contact); !exists {
 		return shared.Response{Status: "error", Message: "Contact user not found"}
 	}
@@ -317,21 +386,17 @@ func (ms *MessengerServer) handleAddContact(request shared.Request) shared.Respo
 	}
 
 	if err := ms.storage.SaveContacts(); err != nil {
-		ms.logger.Error("Failed to save contacts: %v", err)
+		log.Printf("❌ Failed to save contacts: %v", err)
 		return shared.Response{Status: "error", Message: "Failed to save contacts"}
 	}
 
-	ms.logger.Info("✅ Contact added: %s -> %s", request.Username, request.Contact)
+	log.Printf("✅ Contact added: %s -> %s", request.Username, request.Contact)
 	return shared.Response{Status: "success", Message: "Contact added successfully"}
 }
 
 func (ms *MessengerServer) handleCreateGroup(request shared.Request) shared.Response {
 	if request.Username == "" || request.Name == "" {
 		return shared.Response{Status: "error", Message: "Group name and owner are required"}
-	}
-
-	if !ms.validator.ValidateGroupName(request.Name) {
-		return shared.Response{Status: "error", Message: "Group name must be 1-32 characters"}
 	}
 
 	groupID := fmt.Sprintf("group_%d", time.Now().UnixNano())
@@ -345,9 +410,6 @@ func (ms *MessengerServer) handleCreateGroup(request shared.Request) shared.Resp
 
 	// Проверяем существование всех участников
 	for _, member := range request.Members {
-		if !ms.validator.ValidateUsername(member) {
-			return shared.Response{Status: "error", Message: "Invalid username: " + member}
-		}
 		if _, exists := ms.storage.GetUser(member); !exists {
 			return shared.Response{Status: "error", Message: "User " + member + " not found"}
 		}
@@ -356,11 +418,11 @@ func (ms *MessengerServer) handleCreateGroup(request shared.Request) shared.Resp
 	ms.storage.AddGroup(group)
 
 	if err := ms.storage.SaveGroups(); err != nil {
-		ms.logger.Error("Failed to save groups: %v", err)
+		log.Printf("❌ Failed to save groups: %v", err)
 		return shared.Response{Status: "error", Message: "Failed to save group"}
 	}
 
-	ms.logger.Info("✅ Group created: %s (ID: %s) by %s", request.Name, groupID, request.Username)
+	log.Printf("✅ Group created: %s (ID: %s) by %s", request.Name, groupID, request.Username)
 	return shared.Response{
 		Status:  "success",
 		Message: "Group created successfully",
@@ -371,15 +433,6 @@ func (ms *MessengerServer) handleCreateGroup(request shared.Request) shared.Resp
 func (ms *MessengerServer) handleSendMessage(request shared.Request) shared.Response {
 	if request.Username == "" || request.Content == "" {
 		return shared.Response{Status: "error", Message: "Username and content are required"}
-	}
-
-	// Rate limiting для сообщений
-	if !ms.rateLimiter.AllowMessage(request.Username) {
-		return shared.Response{Status: "error", Message: "Message rate limit exceeded. Please slow down."}
-	}
-
-	if !ms.validator.ValidateMessage(request.Content) {
-		return shared.Response{Status: "error", Message: "Message must be 1-1000 characters"}
 	}
 
 	baseTime := time.Now().UnixNano()
@@ -410,7 +463,7 @@ func (ms *MessengerServer) handleSendMessage(request shared.Request) shared.Resp
 		for i, member := range group.Members {
 			if member != request.Username {
 				msg := shared.Message{
-					ID:        baseTime + int64(i), // Уникальный ID для каждого сообщения
+					ID:        baseTime + int64(i),
 					From:      request.Username,
 					To:        member,
 					Content:   request.Content,
@@ -427,10 +480,6 @@ func (ms *MessengerServer) handleSendMessage(request shared.Request) shared.Resp
 			return shared.Response{Status: "error", Message: "Recipient is required for private messages"}
 		}
 
-		if !ms.validator.ValidateUsername(request.To) {
-			return shared.Response{Status: "error", Message: "Invalid recipient username"}
-		}
-
 		msg := shared.Message{
 			ID:        baseTime,
 			From:      request.Username,
@@ -443,7 +492,12 @@ func (ms *MessengerServer) handleSendMessage(request shared.Request) shared.Resp
 		ms.storage.AddMessage(msg)
 	}
 
-	ms.logger.Info("✅ Message sent: %s -> %s (group: %v)", request.Username, request.To, request.IsGroup)
+	if err := ms.storage.SaveMessages(); err != nil {
+		log.Printf("❌ Failed to save messages: %v", err)
+		return shared.Response{Status: "error", Message: "Failed to save message"}
+	}
+
+	log.Printf("✅ Message sent: %s -> %s (group: %v)", request.Username, request.To, request.IsGroup)
 	return shared.Response{Status: "success", Message: "Message sent successfully"}
 }
 
@@ -458,7 +512,7 @@ func (ms *MessengerServer) handleGetMessages(request shared.Request) shared.Resp
 		go ms.storage.SaveMessages()
 	}
 
-	ms.logger.Debug("📨 Retrieved %d messages for user: %s", len(messages), request.Username)
+	log.Printf("📨 Retrieved %d messages for user: %s", len(messages), request.Username)
 	return shared.Response{
 		Status: "success",
 		Data:   messages,
@@ -471,58 +525,9 @@ func (ms *MessengerServer) handleGetContacts(request shared.Request) shared.Resp
 	}
 
 	contacts := ms.storage.GetContacts(request.Username)
-	ms.logger.Debug("👥 Retrieved %d contacts for user: %s", len(contacts), request.Username)
+	log.Printf("👥 Retrieved %d contacts for user: %s", len(contacts), request.Username)
 	return shared.Response{
 		Status: "success",
 		Data:   contacts,
 	}
-}
-
-// Вспомогательные методы
-
-func generateTempPassword() string {
-	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	result := make([]byte, 8)
-	for i := range result {
-		result[i] = chars[rand.Intn(len(chars))]
-	}
-	return string(result)
-}
-
-func (ms *MessengerServer) cleanupWorker(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			ms.rateLimiter.Cleanup()
-			ms.logger.Debug("Rate limiter cleanup completed")
-		}
-	}
-}
-
-func (ms *MessengerServer) performCleanup(ctx context.Context) {
-	// Сохраняем все данные перед завершением
-	ms.logger.Info("Performing final cleanup...")
-
-	if err := ms.storage.SaveUsers(); err != nil {
-		ms.logger.Error("Error saving users during shutdown: %v", err)
-	}
-
-	if err := ms.storage.SaveMessages(); err != nil {
-		ms.logger.Error("Error saving messages during shutdown: %v", err)
-	}
-
-	if err := ms.storage.SaveContacts(); err != nil {
-		ms.logger.Error("Error saving contacts during shutdown: %v", err)
-	}
-
-	if err := ms.storage.SaveGroups(); err != nil {
-		ms.logger.Error("Error saving groups during shutdown: %v", err)
-	}
-
-	ms.logger.Info("Cleanup completed")
 }

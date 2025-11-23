@@ -2,49 +2,70 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"telegraf/config"
 	"telegraf/server"
 )
 
-func main() {
-	// Инициализация конфигурации
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatal("Failed to load configuration:", err)
+func getConfig() (string, string, string) {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
 
-	// Инициализация логгера
-	logger := server.NewLogger(cfg.Environment)
+	httpPort := os.Getenv("HTTP_PORT")
+	if httpPort == "" {
+		// По умолчанию HTTP на порту 8081
+		httpPort = "8081"
+	}
 
-	logger.Info("🚀 Starting P2P Messenger Server...")
-	logger.Info("📍 Environment: %s", cfg.Environment)
-	logger.Info("🔌 Host: %s, Port: %s", cfg.Server.Host, cfg.Server.Port)
-	logger.Info("📊 Max connections: %d", cfg.Server.MaxConnections)
+	environment := os.Getenv("ENVIRONMENT")
+	if environment == "" {
+		environment = "development"
+	}
 
-	// Создание сервера
-	messengerServer := server.NewMessengerServer(cfg, logger)
+	return port, httpPort, environment
+}
 
-	// Graceful shutdown
-	ctx, stop := context.WithCancel(context.Background())
+func main() {
+	port, httpPort, environment := getConfig()
+
+	fmt.Printf("🚀 Starting P2P Messenger Server...\n")
+	fmt.Printf("📍 Environment: %s\n", environment)
+	fmt.Printf("🔌 TCP Port: %s\n", port)
+	fmt.Printf("🌐 HTTP Port: %s\n", httpPort)
+
+	host := "localhost"
+	if environment == "production" {
+		host = "0.0.0.0"
+	}
+
+	serverConfig := server.ServerConfig{
+		Host: host,
+		Port: port,
+	}
+
+	storageConfig := server.StorageConfig{
+		UsersFile:    "users.dat",
+		MessagesFile: "messages.dat",
+		ContactsFile: "contacts.dat",
+		GroupsFile:   "groups.dat",
+	}
+
+	messengerServer := server.NewMessengerServer(serverConfig, storageConfig)
+
+	log.Printf("✅ Server configured - Host: %s, TCP Port: %s, HTTP Port: %s", host, port, httpPort)
+
+	// Создаем контекст для graceful shutdown
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Обработка сигналов
-	go func() {
-		sigchan := make(chan os.Signal, 1)
-		signal.Notify(sigchan, os.Interrupt, syscall.SIGTERM)
-		<-sigchan
-		logger.Info("Received shutdown signal, shutting down gracefully...")
-		stop()
-	}()
-
-	// Запуск сервера
-	if err := messengerServer.Start(ctx); err != nil {
-		logger.Error("Failed to start server: %v", err)
-		os.Exit(1)
+	// Запускаем сервер с HTTP портом
+	if err := messengerServer.Start(ctx, httpPort); err != nil {
+		log.Fatal("Failed to start server:", err)
 	}
 }
